@@ -24,6 +24,7 @@ from streamlit_authenticator.utilities import Hasher
 ANBIETER_TWE = "TWE"
 ANBIETER_PESASUN = "Pesasun"
 ANBIETER_PVPARTNERS = "pv partners"
+ANBIETER_OEKOTEAM = "Ökoteam Solar"
 
 # Kategorien
 KAT_MODULE = "Solarmodule"
@@ -768,6 +769,105 @@ def parse_pvpartners(file_obj, filename: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=SCHEMA) if rows else pd.DataFrame(columns=SCHEMA)
 
 
+# ── Ökoteam Solar ─────────────────────────────────────────────────────────────
+#
+# Format (pro Zeile):  NAME  ART_NUM(5-stellig)  HUAWEI_NUM  PREIS
+# Preisformat:         "1 088,00"  (Leerzeichen als Tausendertrenner, Komma als Dezimal)
+# Kein €-Zeichen.
+
+# Preis am Zeilenende: 1–4 Zifferngruppen à 3 Ziffern, durch Leerzeichen getrennt,
+# gefolgt von Komma und zwei Dezimalstellen.
+# Das führende \s stellt sicher, dass der Preis nicht mitten in einer Artikelnummer
+# gematcht wird (z. B. "016-006 621,00" → nur "621,00", nicht "006 621,00").
+_OKT_PRICE_RE = re.compile(r"\s(\d{1,3}(?:\s\d{3})*,\d{2})\s*$")
+
+# Produktname = alles vor der 5-stelligen Artikelnummer (die immer von Leerzeichen umgeben ist)
+_OKT_ARTNUM_RE = re.compile(r"^(.*?)\s+(\d{5})\s+")
+
+_OKT_SKIP = [
+    "Hersteller", "Art-Num", "Huawei Bezeichnung",
+    "Irrtümer", "Schreibfehler", "typographical",
+    "voraussichtlich verfügbar",
+]
+
+
+def _detect_date_oekoteam(filename: str) -> str:
+    """'Preisliste_..._03052026.pdf'  →  '2026-05-03'  (DDMMYYYY am Dateiende)."""
+    m = re.search(r"(\d{2})(\d{2})(\d{4})\.pdf$", filename, re.IGNORECASE)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    return "unbekannt"
+
+
+def _detect_oekoteam_category(product: str) -> str:
+    pl = product.lower()
+    if "luna2000" in pl:
+        return KAT_SPEICHER
+    if "leistungsoptimierer" in pl:
+        return "Zubehör"
+    if "sun2000" in pl or "sun5000" in pl:
+        return KAT_WECHSELRICHTER
+    return "Zubehör"
+
+
+def _parse_okt_price(price_str: str) -> float | None:
+    """'1 088,00'  →  1088.0  (Leerzeichen-Tausender + Komma-Dezimal, kein €)."""
+    s = price_str.strip().replace(" ", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_oekoteam(file_obj, filename: str) -> pd.DataFrame:
+    """
+    Parser für Ökoteam Solar Preislisten.
+    Jede Produktzeile: NAME  5-DIGIT-ARTNUM  HUAWEI-ARTNUM  PREIS
+    """
+    rows = []
+    date = _detect_date_oekoteam(filename)
+
+    with pdfplumber.open(file_obj) as pdf:
+        for page in pdf.pages:
+            lines = [ln.strip() for ln in (page.extract_text() or "").splitlines()
+                     if ln.strip()]
+
+            for line in lines:
+                # Seitenangaben und bekannte Nicht-Produkt-Zeilen überspringen
+                if line.isdigit():
+                    continue
+                if any(kw in line for kw in _OKT_SKIP):
+                    continue
+
+                # Preis am Zeilenende extrahieren
+                price_m = _OKT_PRICE_RE.search(line)
+                if not price_m:
+                    continue
+
+                price = _parse_okt_price(price_m.group(1))
+                if price is None or price <= 0:
+                    continue
+
+                # Alles vor dem Preis
+                before_price = line[:price_m.start()].strip()
+
+                # Produktname = alles vor der 5-stelligen Artikelnummer
+                name_m = _OKT_ARTNUM_RE.match(before_price)
+                product = name_m.group(1).strip() if name_m else before_price
+
+                if not product or len(product) < 3:
+                    continue
+
+                kategorie = _detect_oekoteam_category(product)
+
+                rows.append(_make_row(
+                    ANBIETER_OEKOTEAM, kategorie, product,
+                    PREISTYP_STUECK, price, "€", date, filename,
+                ))
+
+    return pd.DataFrame(rows, columns=SCHEMA) if rows else pd.DataFrame(columns=SCHEMA)
+
+
 # ── CSV / JSON ────────────────────────────────────────────────────────────────
 
 def parse_csv(file_obj, filename: str) -> pd.DataFrame:
@@ -803,6 +903,8 @@ def parse_file(file_obj, filename: str) -> pd.DataFrame:
         return parse_pesasun(file_obj, filename)
     if "pv_partners" in fn_lower or "pv-partners" in fn_lower:
         return parse_pvpartners(file_obj, filename)
+    if "oekoteam" in fn_lower or "ökoteam" in fn_lower or "preisliste_huawei" in fn_lower:
+        return parse_oekoteam(file_obj, filename)
     # Fallback: als TWE versuchen
     return parse_twe(file_obj, filename)
 
@@ -989,7 +1091,7 @@ with st.sidebar:
 # ── Daten laden ────────────────────────────────────────────────────────────────
 
 st.title("☀️ PV-Preisvergleich")
-st.caption("Lieferanten: TWE Solar GmbH · Pesasun GmbH · pv partners AG")
+st.caption("Lieferanten: TWE Solar GmbH · Pesasun GmbH · pv partners AG · Ökoteam Solar")
 
 
 @st.cache_data(show_spinner="Preislisten werden geparst…")
