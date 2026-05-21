@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(.venv/bin/python -c ' *)",
-      "Bash(curl -s http://localhost:8501)"
+      "Bash(curl -s http://localhost:8501)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/python -c \"import streamlit_authenticator as stauth; print\\(stauth.__version__\\); help\\(stauth.Authenticate.__init__\\)\")"
     ]
   }
 }

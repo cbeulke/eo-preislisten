@@ -1,24 +1,29 @@
 """
 Preisvergleich-App für Photovoltaik-Produkte
-Lieferanten: TWE Solar GmbH, Pesasun GmbH
-Formate: PDF (TWE und Pesasun), erweiterbar auf CSV/JSON
+Lieferanten: TWE Solar GmbH, Pesasun GmbH, pv partners AG
+Formate: PDF, erweiterbar auf CSV/JSON
 """
 
 import io
 import re
+import secrets
 from pathlib import Path
 
 import pandas as pd
 import pdfplumber
 import streamlit as st
+import streamlit_authenticator as stauth
+import yaml
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from streamlit_authenticator.utilities import Hasher
 
 # ── Konstanten ────────────────────────────────────────────────────────────────
 
 ANBIETER_TWE = "TWE"
 ANBIETER_PESASUN = "Pesasun"
+ANBIETER_PVPARTNERS = "pv partners"
 
 # Kategorien
 KAT_MODULE = "Solarmodule"
@@ -558,6 +563,211 @@ def parse_pesasun(file_obj, filename: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=SCHEMA) if rows else pd.DataFrame(columns=SCHEMA)
 
 
+# ── pv partners ───────────────────────────────────────────────────────────────
+
+_PVP_FOOTER = [
+    "pv partners AG", "Großbeerenstr", "Telefon", "Telefax",
+    "www.pv-partners.de", "info@pv-partners.de",
+]
+
+_PVP_SKIP_KEYWORDS = [
+    "PV-Module:", "Gültig für", "Module (Kommissioniert",
+    "Module (Projektmengen", "Verfügbarkeit auf Anfrage",
+    "Mindermengenzuschlag:", "bei Abnahme", "Legende:", "Die Verfügbarkeit",
+    "Alle Angaben", "Produktgarantien", "Alle Preise",
+    "ab 1 Palette", "ab 10 Paletten", "ab 1 Container",
+    "≤ 50 kWp", "> 50 kWp", "Preis je Wp", "Verfügbarkeit",
+    "Sonderpreisliste", "Wechselrichter & Zubehör",
+    "Einzelabnahme", "Abnahme >", "Preis Preis",
+    "Solange der Vorat", "Solange der Vorrat",
+]
+
+# Brands listed in pv partners documents
+_PVP_BRANDS = [
+    "DMEGC Solar", "JA Solar", "LONGI", "Solyco",
+    "Trina Solar", "Fronius", "GoodWe", "Huawei", "KOSTAL", "SMA",
+]
+
+
+def _detect_date_pvpartners(text: str, filename: str) -> str:
+    """'Gültig für Bestellungen ab 11.05.2026' oder '_260511.pdf' → '2026-05-11'."""
+    m = re.search(r"Gültig.*ab\s+(\d{2})\.(\d{2})\.(\d{4})", text)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    m = re.search(r"_(\d{2})(\d{2})(\d{2})\.pdf$", filename, re.IGNORECASE)
+    if m:
+        return f"20{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return "unbekannt"
+
+
+def _normalize_pvp_line(line: str) -> str:
+    """Fix PDF artefact '0 ,133 €' → '0,133 €'."""
+    return re.sub(r"(\d)\s+,(\d)", r"\1,\2", line)
+
+
+def _extract_pvp_product_name(before_price: str) -> str:
+    """
+    Extract 'MODEL [WATT]Wp' from the pre-price text of a pv partners line.
+    Handles three formats:
+      • single-token model + watt:   'DM465G12RT-B48HBW 465 Wp …'
+      • two-token model + watt:      'R-WG 96n.5/465 465 Wp …'
+      • multi-token model, no watt:  'Hi-Mo X10 LR7-54HVH-490M …'
+    """
+    # single token + WATT Wp
+    m = re.match(r"^(\S+)\s+(\d+)\s+Wp\b", before_price)
+    if m:
+        return f"{m.group(1)} {m.group(2)}Wp"
+    # two tokens + WATT Wp  (e.g. Solyco: "R-WG 96n.5/465 465 Wp")
+    m = re.match(r"^(\S+\s+\S+)\s+(\d+)\s+Wp\b", before_price)
+    if m:
+        return f"{m.group(1)} {m.group(2)}Wp"
+    # fallback: first three whitespace-separated tokens (LONGI style)
+    tokens = before_price.split()
+    return " ".join(tokens[:3]) if tokens else "Unbekannt"
+
+
+def _is_pvp_brand_header(line: str) -> bool:
+    """True when the line is a brand/section header with no EUR price."""
+    if _GERMAN_PRICE_RE.search(line):
+        return False
+    return any(b.lower() in line.lower() for b in _PVP_BRANDS)
+
+
+def _parse_pvpartners_module(pdf, filename: str) -> list[dict]:
+    """
+    pv partners Modulpreisliste:
+    • Abschnitt 1 'Kommissioniert & Palettenmengen': 1 Preis/Wp, Preistyp='1 Palette'
+    • Abschnitt 2 'Projektmengen': bis zu 2 Preise/Wp,
+        1. Preis = '10 Paletten', 2. Preis = 'Container'
+    """
+    rows = []
+    text_all = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    date = _detect_date_pvpartners(text_all, filename)
+    section = "palette"
+
+    for page in pdf.pages:
+        text = page.extract_text() or ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        for line in lines:
+            # Section detection
+            if "Kommissioniert" in line or "Palettenmengen" in line:
+                section = "palette"
+                continue
+            if "Projektmengen" in line:
+                section = "projekt"
+                continue
+
+            # Skip footer and irrelevant lines
+            if any(kw in line for kw in _PVP_FOOTER + _PVP_SKIP_KEYWORDS):
+                continue
+
+            # Normalize space-in-decimal artefact
+            line_n = _normalize_pvp_line(line)
+
+            # Brand/section headers have no price → skip
+            if _is_pvp_brand_header(line_n):
+                continue
+
+            prices = _all_prices_in_line(line_n)
+            if not prices:
+                continue
+
+            # Everything before the first price
+            pm = _GERMAN_PRICE_RE.search(line_n)
+            before_price = line_n[:pm.start()].strip() if pm else ""
+
+            # Remove availability marker at the end of before_price (section 1 only)
+            before_price = re.sub(
+                r"\s*(verfügbar|KW\s*\d+/\d+|auf\s*Anfrage)\s*$",
+                "", before_price, flags=re.IGNORECASE,
+            ).strip()
+
+            product = _extract_pvp_product_name(before_price)
+
+            if not product or len(product) < 3:
+                continue
+            # Skip footnote/surcharge lines with zero price
+            if prices[0] == 0.0:
+                continue
+
+            if section == "palette":
+                rows.append(_make_row(
+                    ANBIETER_PVPARTNERS, KAT_MODULE, product,
+                    "1 Palette", prices[0], "€/Wp", date, filename,
+                ))
+            else:
+                rows.append(_make_row(
+                    ANBIETER_PVPARTNERS, KAT_MODULE, product,
+                    "10 Paletten", prices[0], "€/Wp", date, filename,
+                ))
+                if len(prices) >= 2:
+                    rows.append(_make_row(
+                        ANBIETER_PVPARTNERS, KAT_MODULE, product,
+                        PREISTYP_CONTAINER, prices[1], "€/Wp", date, filename,
+                    ))
+
+    return rows
+
+
+def _parse_pvpartners_sonderliste(pdf, filename: str) -> list[dict]:
+    """
+    pv partners Sonderpreisliste (Wechselrichter & Zubehör):
+    Zwei optionale Preisspalten: Einzelabnahme / Abnahme > 3 Stk.
+    """
+    rows = []
+    text_all = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    date = _detect_date_pvpartners(text_all, filename)
+
+    for page in pdf.pages:
+        text = page.extract_text() or ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        for line in lines:
+            if any(kw in line for kw in _PVP_FOOTER + _PVP_SKIP_KEYWORDS):
+                continue
+
+            line_n = _normalize_pvp_line(line)
+            prices = _all_prices_in_line(line_n)
+            if not prices:
+                continue
+
+            pm = _GERMAN_PRICE_RE.search(line_n)
+            product = line_n[:pm.start()].strip() if pm else ""
+            if not product or len(product) < 3:
+                continue
+
+            # Determine category from product name
+            kat = (
+                "Zubehör"
+                if any(kw in product for kw in ["Meter", "Smart Meter", "Zubehör", "Sensor"])
+                else KAT_WECHSELRICHTER
+            )
+
+            rows.append(_make_row(
+                ANBIETER_PVPARTNERS, kat, product,
+                "Einzelabnahme", prices[0], "€", date, filename,
+            ))
+            if len(prices) >= 2:
+                rows.append(_make_row(
+                    ANBIETER_PVPARTNERS, kat, product,
+                    "Mengenpreis (>3 Stk.)", prices[1], "€", date, filename,
+                ))
+
+    return rows
+
+
+def parse_pvpartners(file_obj, filename: str) -> pd.DataFrame:
+    """Erkennt pv-partners-Listentyp aus Dateiinhalt und parst entsprechend."""
+    with pdfplumber.open(file_obj) as pdf:
+        first_page_text = pdf.pages[0].extract_text() or ""
+        if "PV-Module" in first_page_text or "Modulpreis" in filename.lower():
+            rows = _parse_pvpartners_module(pdf, filename)
+        else:
+            rows = _parse_pvpartners_sonderliste(pdf, filename)
+    return pd.DataFrame(rows, columns=SCHEMA) if rows else pd.DataFrame(columns=SCHEMA)
+
+
 # ── CSV / JSON ────────────────────────────────────────────────────────────────
 
 def parse_csv(file_obj, filename: str) -> pd.DataFrame:
@@ -591,6 +801,8 @@ def parse_file(file_obj, filename: str) -> pd.DataFrame:
         return parse_twe(file_obj, filename)
     if "pesasun" in fn_lower or "produktkatalog" in fn_lower:
         return parse_pesasun(file_obj, filename)
+    if "pv_partners" in fn_lower or "pv-partners" in fn_lower:
+        return parse_pvpartners(file_obj, filename)
     # Fallback: als TWE versuchen
     return parse_twe(file_obj, filename)
 
@@ -654,12 +866,105 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("☀️ PV-Preisvergleich")
-st.caption("Lieferanten: TWE Solar GmbH · Pesasun GmbH")
+# ── Auth-Hilfsfunktionen ──────────────────────────────────────────────────────
 
-# ── Daten laden ────────────────────────────────────────────────────────────────
+AUTH_CONFIG_PATH = Path("auth_config.yaml")
+ROLES = ["admin", "viewer"]
+
+
+def _load_auth_config() -> dict:
+    """Lädt auth_config.yaml. Erstellt Standardkonfiguration falls nicht vorhanden."""
+    if AUTH_CONFIG_PATH.exists():
+        with open(AUTH_CONFIG_PATH, "r") as f:
+            return yaml.safe_load(f)
+    # Erstmalige Einrichtung: Standard-Admin anlegen
+    default_pw = Hasher.hash("admin")
+    cfg = {
+        "credentials": {
+            "usernames": {
+                "admin": {
+                    "name": "Administrator",
+                    "email": "admin@local",
+                    "password": default_pw,
+                    "roles": ["admin"],
+                }
+            }
+        },
+        "cookie": {
+            "name": "pv_preisvergleich",
+            "key": secrets.token_hex(32),
+            "expiry_days": 30,
+        },
+    }
+    _save_auth_config(cfg)
+    return cfg
+
+
+def _save_auth_config(cfg: dict) -> None:
+    with open(AUTH_CONFIG_PATH, "w") as f:
+        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+
+
+def _current_roles() -> list[str]:
+    """Gibt die Rollen des eingeloggten Benutzers zurück."""
+    username = st.session_state.get("username", "")
+    cfg = st.session_state.get("_auth_cfg", {})
+    user = cfg.get("credentials", {}).get("usernames", {}).get(username, {})
+    return user.get("roles", [])
+
+
+def _is_admin() -> bool:
+    return "admin" in _current_roles()
+
+
+# ── Auth initialisieren ───────────────────────────────────────────────────────
+
+cfg = _load_auth_config()
+st.session_state["_auth_cfg"] = cfg
+
+authenticator = stauth.Authenticate(
+    credentials=cfg["credentials"],
+    cookie_name=cfg["cookie"]["name"],
+    cookie_key=cfg["cookie"]["key"],
+    cookie_expiry_days=cfg["cookie"]["expiry_days"],
+    auto_hash=False,
+)
+
+# ── Login-Seite ───────────────────────────────────────────────────────────────
+
+authenticator.login(
+    location="main",
+    fields={"Form name": "☀️ PV-Preisvergleich · Anmeldung",
+            "Username": "Benutzername",
+            "Password": "Passwort",
+            "Login": "Anmelden"},
+)
+
+auth_status = st.session_state.get("authentication_status")
+username    = st.session_state.get("username", "")
+name        = st.session_state.get("name", "")
+
+if auth_status is False:
+    st.error("Benutzername oder Passwort falsch.")
+    st.stop()
+
+if auth_status is None:
+    st.info("Bitte melden Sie sich an.")
+    st.stop()
+
+# ─── ab hier: Benutzer ist authentifiziert ───────────────────────────────────
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
+    st.markdown(f"**{name}** `{' · '.join(_current_roles())}`")
+    authenticator.logout(
+        button_name="🚪 Abmelden",
+        location="sidebar",
+        key="sidebar_logout",
+    )
+    st.divider()
+
     st.header("Datenquellen")
 
     lists_dir = Path("lists")
@@ -680,6 +985,11 @@ with st.sidebar:
 
     st.divider()
     st.header("Filter")
+
+# ── Daten laden ────────────────────────────────────────────────────────────────
+
+st.title("☀️ PV-Preisvergleich")
+st.caption("Lieferanten: TWE Solar GmbH · Pesasun GmbH · pv partners AG")
 
 
 @st.cache_data(show_spinner="Preislisten werden geparst…")
@@ -705,7 +1015,6 @@ for uf in uploaded or []:
 if frames:
     df_all = pd.concat(frames, ignore_index=True)
     df_all["Preis"] = pd.to_numeric(df_all["Preis"], errors="coerce")
-    # Duplikate entfernen (gleicher Anbieter, Produkt, Preistyp, Datum)
     df_all = df_all.drop_duplicates(
         subset=["Anbieter", "Produkt", "Preistyp", "Datum", "Einheit"]
     )
@@ -719,15 +1028,15 @@ with st.sidebar:
         st.info("Noch keine Daten geladen.")
     else:
         anbieter_opts = sorted(df_all["Anbieter"].dropna().unique())
-        kat_opts = sorted(df_all["Kategorie"].dropna().unique())
-        datum_opts = sorted(df_all["Datum"].dropna().unique(), reverse=True)
+        kat_opts      = sorted(df_all["Kategorie"].dropna().unique())
+        datum_opts    = sorted(df_all["Datum"].dropna().unique(), reverse=True)
+        einheit_opts  = sorted(df_all["Einheit"].dropna().unique())
 
-        sel_anbieter = st.multiselect("Anbieter", anbieter_opts, default=anbieter_opts)
-        sel_kat = st.multiselect("Kategorie", kat_opts, default=kat_opts)
-        sel_datum = st.multiselect("Preislisten-Datum", datum_opts, default=datum_opts)
-        einheit_opts = sorted(df_all["Einheit"].dropna().unique())
-        sel_einheit = st.multiselect("Einheit", einheit_opts, default=einheit_opts)
-        search = st.text_input("Produkt suchen", placeholder="z.B. Sungrow, 470W …")
+        sel_anbieter = st.multiselect("Anbieter",           anbieter_opts, default=anbieter_opts)
+        sel_kat      = st.multiselect("Kategorie",          kat_opts,      default=kat_opts)
+        sel_datum    = st.multiselect("Preislisten-Datum",  datum_opts,    default=datum_opts)
+        sel_einheit  = st.multiselect("Einheit",            einheit_opts,  default=einheit_opts)
+        search       = st.text_input("Produkt suchen", placeholder="z.B. Sungrow, 470W …")
 
         mask = (
             df_all["Anbieter"].isin(sel_anbieter)
@@ -751,19 +1060,21 @@ if df_all.empty:
 
 # Kennzahlen
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Einträge gesamt", f"{len(df_filtered):,}")
-col2.metric("Produkte", df_filtered["Produkt"].nunique())
-col3.metric("Anbieter", df_filtered["Anbieter"].nunique())
+col1.metric("Einträge gesamt",  f"{len(df_filtered):,}")
+col2.metric("Produkte",         df_filtered["Produkt"].nunique())
+col3.metric("Anbieter",         df_filtered["Anbieter"].nunique())
 col4.metric("Preislisten-Daten", df_filtered["Datum"].nunique())
 
 st.divider()
 
-tab_all, tab_compare, tab_history, tab_export = st.tabs([
-    "📋 Alle Preise",
-    "⚖️ Preisvergleich",
-    "📈 Preishistorie",
-    "💾 Export",
-])
+# Tabs – Admins sehen zusätzlich den Benutzerverwaltungs-Tab
+_tab_labels = ["📋 Alle Preise", "⚖️ Preisvergleich", "📈 Preishistorie", "💾 Export"]
+if _is_admin():
+    _tab_labels.append("👤 Benutzerverwaltung")
+
+_tabs = st.tabs(_tab_labels)
+tab_all, tab_compare, tab_history, tab_export = _tabs[:4]
+tab_users = _tabs[4] if _is_admin() else None
 
 # ── Tab: Alle Preise ──────────────────────────────────────────────────────────
 
@@ -808,22 +1119,14 @@ with tab_compare:
     if df_v.empty:
         st.info("Keine Daten für diese Kombination.")
     else:
-        # Neuestes Datum pro Anbieter
         df_v["Datum"] = df_v["Datum"].astype(str)
-        latest = (
-            df_v.groupby("Anbieter")["Datum"].max().reset_index(name="MaxDatum")
-        )
-        df_v = df_v.merge(latest, on="Anbieter")
+        latest   = df_v.groupby("Anbieter")["Datum"].max().reset_index(name="MaxDatum")
+        df_v     = df_v.merge(latest, on="Anbieter")
         df_latest = df_v[df_v["Datum"] == df_v["MaxDatum"]].drop(columns=["MaxDatum"])
 
         pivot = (
             df_latest
-            .pivot_table(
-                index="Produkt",
-                columns="Anbieter",
-                values="Preis",
-                aggfunc="min",
-            )
+            .pivot_table(index="Produkt", columns="Anbieter", values="Preis", aggfunc="min")
             .reset_index()
         )
 
@@ -840,13 +1143,8 @@ with tab_compare:
         if "Differenz" in pivot.columns:
             fmt["Differenz"] = "{:+,.2f}"
 
-        st.dataframe(
-            pivot.style.format(fmt, na_rep="–"),
-            use_container_width=True,
-            height=480,
-        )
+        st.dataframe(pivot.style.format(fmt, na_rep="–"), use_container_width=True, height=480)
 
-        # Günstigster Anbieter pro Produkt
         if len(anbieter_cols) >= 1:
             min_price = df_latest.loc[
                 df_latest.groupby("Produkt")["Preis"].idxmin()
@@ -856,8 +1154,7 @@ with tab_compare:
             st.markdown("**Günstigster Anbieter je Produkt**")
             st.dataframe(
                 min_price.style.format({"Günstigster Preis": "{:,.2f}"}),
-                use_container_width=True,
-                height=300,
+                use_container_width=True, height=300,
             )
 
 # ── Tab: Preishistorie ────────────────────────────────────────────────────────
@@ -891,22 +1188,19 @@ with tab_history:
         if df_h.empty:
             st.info("Keine Daten.")
         else:
-            # Nur Produkte mit mehreren Datenpunkten
             prod_counts = df_h.groupby("Produkt")["Datum"].nunique()
             multi_prods = prod_counts[prod_counts >= 2].index.tolist()
 
             if not multi_prods:
                 st.info("Keine Produkte mit mehreren Preisdaten gefunden.")
             else:
-                sel_prod = st.multiselect(
+                sel_prod  = st.multiselect(
                     "Produkte auswählen", multi_prods, default=multi_prods[:5], key="hist_prod"
                 )
-                df_h_sel = df_h[df_h["Produkt"].isin(sel_prod)]
-
+                df_h_sel  = df_h[df_h["Produkt"].isin(sel_prod)]
                 pivot_hist = df_h_sel.pivot_table(
                     index="Datum", columns="Produkt", values="Preis", aggfunc="min"
                 ).sort_index()
-
                 st.line_chart(pivot_hist, height=400)
 
                 st.markdown("**Preisveränderung (ältestes → neuestes Datum)**")
@@ -914,29 +1208,23 @@ with tab_history:
                 for prod in sel_prod:
                     sub = df_h_sel[df_h_sel["Produkt"] == prod].sort_values("Datum")
                     if len(sub) >= 2:
-                        old_p = sub.iloc[0]["Preis"]
-                        new_p = sub.iloc[-1]["Preis"]
-                        old_d = sub.iloc[0]["Datum"]
-                        new_d = sub.iloc[-1]["Datum"]
+                        old_p, new_p = sub.iloc[0]["Preis"], sub.iloc[-1]["Preis"]
+                        old_d, new_d = sub.iloc[0]["Datum"],  sub.iloc[-1]["Datum"]
                         if pd.notna(old_p) and pd.notna(new_p) and old_p != 0:
-                            change = (new_p - old_p) / old_p * 100
                             change_rows.append({
                                 "Produkt": prod,
                                 f"Preis {old_d}": old_p,
                                 f"Preis {new_d}": new_p,
-                                "Veränderung %": change,
+                                "Veränderung %": (new_p - old_p) / old_p * 100,
                             })
                 if change_rows:
-                    df_change = pd.DataFrame(change_rows)
-                    num_cols = [c for c in df_change.columns if c != "Produkt"]
+                    df_change  = pd.DataFrame(change_rows)
+                    num_cols   = [c for c in df_change.columns if c != "Produkt"]
                     st.dataframe(
-                        df_change.style.format(
-                            {c: "{:,.2f}" for c in num_cols if "%" not in c}
-                        ).format(
-                            {c: "{:+.1f}%" for c in num_cols if "%" in c}
-                        ).background_gradient(
-                            subset=["Veränderung %"], cmap="RdYlGn_r"
-                        ),
+                        df_change.style
+                        .format({c: "{:,.2f}"  for c in num_cols if "%" not in c})
+                        .format({c: "{:+.1f}%" for c in num_cols if "%" in c})
+                        .background_gradient(subset=["Veränderung %"], cmap="RdYlGn_r"),
                         use_container_width=True,
                     )
 
@@ -973,3 +1261,152 @@ with tab_export:
     st.markdown("---")
     st.markdown("**Vorschau der exportierten Daten:**")
     st.dataframe(df_filtered.head(20), use_container_width=True)
+
+# ── Tab: Benutzerverwaltung (nur Admins) ──────────────────────────────────────
+
+if _is_admin() and tab_users is not None:
+    with tab_users:
+        st.subheader("👤 Benutzerverwaltung")
+
+        # Aktuellen Config neu laden (andere Admins könnten ihn verändert haben)
+        live_cfg = _load_auth_config()
+        users    = live_cfg["credentials"]["usernames"]
+
+        # ── Benutzertabelle ───────────────────────────────────────────────────
+        st.markdown("#### Aktuelle Benutzer")
+        user_rows = [
+            {
+                "Benutzername": uname,
+                "Name":         udata.get("name", ""),
+                "E-Mail":       udata.get("email", ""),
+                "Rollen":       ", ".join(udata.get("roles", [])),
+            }
+            for uname, udata in sorted(users.items())
+        ]
+        st.dataframe(pd.DataFrame(user_rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── Aktionen in Spalten ───────────────────────────────────────────────
+        col_add, col_edit, col_del = st.columns(3)
+
+        # ── Benutzer hinzufügen ───────────────────────────────────────────────
+        with col_add:
+            st.markdown("#### ➕ Neuer Benutzer")
+            with st.form("form_add_user", clear_on_submit=True):
+                new_uname  = st.text_input("Benutzername")
+                new_name   = st.text_input("Anzeigename")
+                new_email  = st.text_input("E-Mail")
+                new_pw     = st.text_input("Passwort", type="password")
+                new_pw2    = st.text_input("Passwort wiederholen", type="password")
+                new_roles  = st.multiselect("Rollen", ROLES, default=["viewer"])
+                submitted  = st.form_submit_button("Benutzer anlegen", use_container_width=True)
+
+            if submitted:
+                err = None
+                if not new_uname:
+                    err = "Benutzername darf nicht leer sein."
+                elif new_uname in users:
+                    err = f"Benutzername '{new_uname}' existiert bereits."
+                elif len(new_pw) < 6:
+                    err = "Passwort muss mindestens 6 Zeichen haben."
+                elif new_pw != new_pw2:
+                    err = "Passwörter stimmen nicht überein."
+                elif not new_roles:
+                    err = "Mindestens eine Rolle muss gewählt werden."
+                if err:
+                    st.error(err)
+                else:
+                    live_cfg["credentials"]["usernames"][new_uname] = {
+                        "name":     new_name,
+                        "email":    new_email,
+                        "password": Hasher.hash(new_pw),
+                        "roles":    new_roles,
+                    }
+                    _save_auth_config(live_cfg)
+                    st.success(f"Benutzer **{new_uname}** wurde angelegt.")
+                    st.rerun()
+
+        # ── Benutzer bearbeiten ───────────────────────────────────────────────
+        with col_edit:
+            st.markdown("#### ✏️ Benutzer bearbeiten")
+            edit_uname = st.selectbox(
+                "Benutzer auswählen", sorted(users.keys()), key="edit_select"
+            )
+            edit_data  = users.get(edit_uname, {})
+
+            with st.form("form_edit_user"):
+                edit_name  = st.text_input("Anzeigename",  value=edit_data.get("name", ""))
+                edit_email = st.text_input("E-Mail",        value=edit_data.get("email", ""))
+                edit_roles = st.multiselect(
+                    "Rollen", ROLES,
+                    default=[r for r in edit_data.get("roles", []) if r in ROLES],
+                )
+                st.markdown("**Passwort ändern** *(leer lassen = unverändert)*")
+                edit_pw    = st.text_input("Neues Passwort",            type="password")
+                edit_pw2   = st.text_input("Neues Passwort wiederholen", type="password")
+                save_edit  = st.form_submit_button("Speichern", use_container_width=True)
+
+            if save_edit:
+                err = None
+                if not edit_roles:
+                    err = "Mindestens eine Rolle muss gewählt werden."
+                elif edit_uname == username and "admin" not in edit_roles:
+                    err = "Du kannst dir selbst die Admin-Rolle nicht entziehen."
+                elif edit_pw and len(edit_pw) < 6:
+                    err = "Neues Passwort muss mindestens 6 Zeichen haben."
+                elif edit_pw and edit_pw != edit_pw2:
+                    err = "Passwörter stimmen nicht überein."
+                if err:
+                    st.error(err)
+                else:
+                    live_cfg["credentials"]["usernames"][edit_uname]["name"]  = edit_name
+                    live_cfg["credentials"]["usernames"][edit_uname]["email"] = edit_email
+                    live_cfg["credentials"]["usernames"][edit_uname]["roles"] = edit_roles
+                    if edit_pw:
+                        live_cfg["credentials"]["usernames"][edit_uname]["password"] = (
+                            Hasher.hash(edit_pw)
+                        )
+                    _save_auth_config(live_cfg)
+                    st.success(f"Benutzer **{edit_uname}** wurde aktualisiert.")
+                    st.rerun()
+
+        # ── Benutzer löschen ──────────────────────────────────────────────────
+        with col_del:
+            st.markdown("#### 🗑️ Benutzer löschen")
+            del_candidates = [u for u in sorted(users.keys()) if u != username]
+            if not del_candidates:
+                st.info("Keine anderen Benutzer vorhanden.")
+            else:
+                del_uname = st.selectbox(
+                    "Benutzer auswählen", del_candidates, key="del_select"
+                )
+                st.warning(
+                    f"Benutzer **{del_uname}** wird dauerhaft gelöscht.",
+                    icon="⚠️",
+                )
+                if st.button("🗑️ Jetzt löschen", type="primary", use_container_width=True):
+                    del live_cfg["credentials"]["usernames"][del_uname]
+                    _save_auth_config(live_cfg)
+                    st.success(f"Benutzer **{del_uname}** wurde gelöscht.")
+                    st.rerun()
+
+        # ── Eigenes Passwort ändern ───────────────────────────────────────────
+        st.divider()
+        st.markdown("#### 🔑 Eigenes Passwort ändern")
+        with st.form("form_own_pw", clear_on_submit=True):
+            own_pw_new  = st.text_input("Neues Passwort",             type="password")
+            own_pw_new2 = st.text_input("Neues Passwort wiederholen", type="password")
+            own_pw_save = st.form_submit_button("Passwort ändern", use_container_width=True)
+
+        if own_pw_save:
+            if len(own_pw_new) < 6:
+                st.error("Passwort muss mindestens 6 Zeichen haben.")
+            elif own_pw_new != own_pw_new2:
+                st.error("Passwörter stimmen nicht überein.")
+            else:
+                live_cfg["credentials"]["usernames"][username]["password"] = (
+                    Hasher.hash(own_pw_new)
+                )
+                _save_auth_config(live_cfg)
+                st.success("Passwort wurde geändert.")
