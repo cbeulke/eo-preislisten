@@ -29,3 +29,6 @@ htmlcov/
 # Environment variables
 .env
 .env.*
+
+# Auth config (contains hashed passwords)
+auth_config.yaml
