@@ -1,0 +1,12 @@
+[
+  {
+    "Anbieter": "Pesasun",
+    "Kategorie": "Solarmodule",
+    "Produkt": "JSON-Modul",
+    "Preistyp": "Stück",
+    "Preis": 500.0,
+    "Einheit": "€",
+    "Datum": "2026-06-01",
+    "Quelle": "sample_prices.json"
+  }
+]

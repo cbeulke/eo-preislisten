@@ -9,3 +9,4 @@ bcrypt>=5.0.0
 PyJWT>=2.12.1
 extra-streamlit-components>=0.1.81
 APScheduler>=3.10.4
+rapidfuzz>=3.0.0
