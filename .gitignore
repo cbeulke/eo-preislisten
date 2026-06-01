@@ -32,3 +32,8 @@ htmlcov/
 
 # Auth config (contains hashed passwords)
 auth_config.yaml
+
+# E-Mail Import & Laufzeitdaten
+email_config.yaml
+data/
+lists/inbox/

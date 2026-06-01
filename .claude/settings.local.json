@@ -4,7 +4,12 @@
       "Bash(.venv/bin/python -c ' *)",
       "Bash(curl -s http://localhost:8501)",
       "Bash(.venv/bin/pip install *)",
-      "Bash(.venv/bin/python -c \"import streamlit_authenticator as stauth; print\\(stauth.__version__\\); help\\(stauth.Authenticate.__init__\\)\")"
+      "Bash(.venv/bin/python -c \"import streamlit_authenticator as stauth; print\\(stauth.__version__\\); help\\(stauth.Authenticate.__init__\\)\")",
+      "Bash(git checkout *)",
+      "Bash(git merge --no-ff feature/session-enhancements -m ' *)",
+      "Bash(git push *)",
+      "Bash(git branch *)",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('pdf_preislisten_vergleich_app.py'\\).read\\(\\)\\); print\\('✓ Syntax OK'\\)\")"
     ]
   }
 }

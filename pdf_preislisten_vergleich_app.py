@@ -5,8 +5,10 @@ Formate: PDF, erweiterbar auf CSV/JSON
 """
 
 import io
+import json
 import re
 import secrets
+import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -14,10 +16,14 @@ import pdfplumber
 import streamlit as st
 import streamlit_authenticator as stauth
 import yaml
+from apscheduler.schedulers.background import BackgroundScheduler
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from streamlit_authenticator.utilities import Hasher
+
+from alert_engine import compute_alerts, load_snapshot, save_snapshot
+from email_importer import ImportResult, load_email_config, poll_once
 
 # ── Konstanten ────────────────────────────────────────────────────────────────
 
@@ -25,6 +31,9 @@ ANBIETER_TWE = "TWE"
 ANBIETER_PESASUN = "Pesasun"
 ANBIETER_PVPARTNERS = "pv partners"
 ANBIETER_OEKOTEAM = "Ökoteam Solar"
+
+DATA_DIR = Path("data")
+SENTINEL = DATA_DIR / "last_import.json"
 
 # Kategorien
 KAT_MODULE = "Solarmodule"
@@ -960,6 +969,34 @@ def _to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+# ── APScheduler ──────────────────────────────────────────────────────────────
+
+
+@st.cache_resource
+def _get_scheduler() -> BackgroundScheduler:
+    """Prozessweiter Singleton – überlebt Streamlit-Reruns."""
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.start()
+    return scheduler
+
+
+def _email_poll_job() -> None:
+    """
+    Wird vom APScheduler-Background-Thread aufgerufen.
+    Nur Filesystem-I/O – kein Zugriff auf Streamlit-State.
+    """
+    cfg = load_email_config()
+    if cfg is None:
+        return
+    result = poll_once(cfg)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SENTINEL.write_text(json.dumps({
+        "timestamp": result.timestamp.isoformat(),
+        "imported":  result.imported,
+        "errors":    result.errors,
+    }))
+
+
 # ── Streamlit App ─────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -1067,6 +1104,62 @@ with st.sidebar:
     )
     st.divider()
 
+    # ── E-Mail Import ─────────────────────────────────────────────────────────
+    _email_cfg = load_email_config()
+    if _email_cfg is not None:
+        st.header("E-Mail Import")
+
+        # Scheduler einmalig registrieren (idempotent durch job_id)
+        _sched = _get_scheduler()
+        if not _sched.get_job("email_poll"):
+            _sched.add_job(
+                _email_poll_job,
+                trigger="interval",
+                minutes=_email_cfg["import"]["poll_interval_minutes"],
+                id="email_poll",
+                max_instances=1,
+                replace_existing=True,
+            )
+
+        # mtime-basierte Cache-Invalidierung (thread-sicher: nur Main-Thread
+        # ruft st.cache_data.clear() auf)
+        if SENTINEL.exists():
+            _mtime = SENTINEL.stat().st_mtime
+            if st.session_state.get("_import_mtime") != _mtime:
+                st.session_state["_import_mtime"] = _mtime
+                st.cache_data.clear()
+                st.rerun()
+            _s = json.loads(SENTINEL.read_text())
+            st.caption(f"Letzter Import: {_s['timestamp'][:16].replace('T', ' ')} UTC")
+            st.caption(f"Importiert: {_s['imported']} Datei(en)")
+            if _s.get("errors"):
+                with st.expander(f"⚠️ {len(_s['errors'])} Fehler"):
+                    for _e in _s["errors"]:
+                        st.error(_e)
+        else:
+            st.caption(f"Nächste Prüfung in ~{_email_cfg['import']['poll_interval_minutes']} Min.")
+
+        if _is_admin() and st.button("▶️ Jetzt importieren", use_container_width=True,
+                                      key="btn_import_now"):
+            with st.spinner("Importiere E-Mail-Anhänge…"):
+                _r: ImportResult = poll_once(_email_cfg)
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            SENTINEL.write_text(json.dumps({
+                "timestamp": _r.timestamp.isoformat(),
+                "imported":  _r.imported,
+                "errors":    _r.errors,
+            }))
+            if _r.imported:
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.info(f"Keine neuen Anhänge ({_r.checked} E-Mail(s) geprüft).")
+
+        st.divider()
+    elif _is_admin():
+        st.caption("📧 E-Mail Import: nicht konfiguriert")
+        st.divider()
+
     st.header("Datenquellen")
 
     lists_dir = Path("lists")
@@ -1092,6 +1185,23 @@ with st.sidebar:
 
 st.title("☀️ PV-Preisvergleich")
 st.caption("Lieferanten: TWE Solar GmbH · Pesasun GmbH · pv partners AG · Ökoteam Solar")
+
+# ── Meldungs-Banner ───────────────────────────────────────────────────────────
+_alerts_new     = st.session_state.get("_alerts_new",     pd.DataFrame())
+_alerts_changed = st.session_state.get("_alerts_changed", pd.DataFrame())
+_alerts_removed = st.session_state.get("_alerts_removed", pd.DataFrame())
+_total_alerts   = len(_alerts_new) + len(_alerts_changed) + len(_alerts_removed)
+
+if _total_alerts == 0:
+    st.success("✅ Keine neuen Meldungen – alle Daten entsprechen dem letzten bekannten Stand.")
+else:
+    _bc1, _bc2, _bc3 = st.columns(3)
+    _bc1.warning(f"🆕 **{len(_alerts_new)}** neue Produkte")
+    _bc2.error(  f"💰 **{len(_alerts_changed)}** Preisänderungen")
+    _bc3.warning(f"🚫 **{len(_alerts_removed)}** nicht mehr verfügbar")
+    st.info("Details im Tab **🔔 Meldungen** unten.")
+
+st.divider()
 
 
 @st.cache_data(show_spinner="Preislisten werden geparst…")
@@ -1122,6 +1232,24 @@ if frames:
     )
 else:
     df_all = pd.DataFrame(columns=SCHEMA)
+
+# ── Snapshot & Alert-Berechnung ───────────────────────────────────────────────
+# Alerts werden einmal pro Session berechnet, wenn sich die Snapshot-Basis
+# ändert.  Der Vergleich erfolgt über snapshot_ts (ISO-Timestamp).
+if not df_all.empty:
+    _snap = load_snapshot()
+    _snap_ts = _snap["snapshot_ts"].iloc[0] if not _snap.empty else None
+    if st.session_state.get("_snap_ts") != _snap_ts:
+        if not _snap.empty:
+            _n, _c, _r = compute_alerts(df_all, _snap)
+            st.session_state["_alerts_new"]     = _n
+            st.session_state["_alerts_changed"] = _c
+            st.session_state["_alerts_removed"] = _r
+        save_snapshot(df_all)
+        _new_snap = load_snapshot()
+        st.session_state["_snap_ts"] = (
+            _new_snap["snapshot_ts"].iloc[0] if not _new_snap.empty else None
+        )
 
 # ── Sidebar-Filter ─────────────────────────────────────────────────────────────
 
@@ -1169,14 +1297,104 @@ col4.metric("Preislisten-Daten", df_filtered["Datum"].nunique())
 
 st.divider()
 
-# Tabs – Admins sehen zusätzlich den Benutzerverwaltungs-Tab
-_tab_labels = ["📋 Alle Preise", "⚖️ Preisvergleich", "📈 Preishistorie", "💾 Export"]
+# Tabs – Meldungen steht an erster Position; Admins sehen zusätzlich Benutzerverwaltung
+_tab_labels = ["🔔 Meldungen", "📋 Alle Preise", "⚖️ Preisvergleich",
+               "📈 Preishistorie", "💾 Export"]
 if _is_admin():
     _tab_labels.append("👤 Benutzerverwaltung")
 
 _tabs = st.tabs(_tab_labels)
-tab_all, tab_compare, tab_history, tab_export = _tabs[:4]
-tab_users = _tabs[4] if _is_admin() else None
+tab_alerts, tab_all, tab_compare, tab_history, tab_export = _tabs[:5]
+tab_users = _tabs[5] if _is_admin() else None
+
+# ── Tab: Meldungen ───────────────────────────────────────────────────────────
+
+with tab_alerts:
+    st.subheader("Meldungen & Preisänderungen")
+
+    _t_new     = st.session_state.get("_alerts_new",     pd.DataFrame())
+    _t_changed = st.session_state.get("_alerts_changed", pd.DataFrame())
+    _t_removed = st.session_state.get("_alerts_removed", pd.DataFrame())
+
+    if _t_new.empty and _t_changed.empty and _t_removed.empty:
+        st.success(
+            "✅ Keine aktuellen Meldungen. "
+            "Beim ersten Laden wird ein Snapshot erstellt – "
+            "Meldungen erscheinen beim nächsten Datenstand."
+        )
+    else:
+        _mc1, _mc2, _mc3 = st.columns(3)
+        _mc1.metric("Neue Produkte",        len(_t_new))
+        _mc2.metric("Preisänderungen",       len(_t_changed))
+        _mc3.metric("Nicht mehr verfügbar",  len(_t_removed))
+
+        st.divider()
+
+        # ── Neue Produkte ─────────────────────────────────────────────────────
+        with st.expander(f"🆕 Neue Produkte ({len(_t_new)})",
+                         expanded=not _t_new.empty):
+            if _t_new.empty:
+                st.info("Keine neuen Produkte.")
+            else:
+                _show = ["Anbieter", "Kategorie", "Produkt", "Preistyp", "Preis",
+                         "Einheit", "Datum"]
+                st.dataframe(
+                    _t_new[_show]
+                    .sort_values(["Anbieter", "Kategorie", "Produkt"])
+                    .style.format({"Preis": lambda x: f"{x:,.2f}" if pd.notna(x) else "–"}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        # ── Preisänderungen ───────────────────────────────────────────────────
+        with st.expander(f"💰 Preisänderungen ({len(_t_changed)})",
+                         expanded=not _t_changed.empty):
+            if _t_changed.empty:
+                st.info("Keine Preisänderungen.")
+            else:
+                _show_chg = ["Anbieter", "Produkt", "Preistyp", "Einheit",
+                             "Preis_alt", "Preis_neu", "Differenz", "Änderung_%"]
+                _show_chg = [c for c in _show_chg if c in _t_changed.columns]
+                st.dataframe(
+                    _t_changed[_show_chg]
+                    .sort_values("Änderung_%")
+                    .style
+                    .format({
+                        "Preis_alt":  "{:,.2f}",
+                        "Preis_neu":  "{:,.2f}",
+                        "Differenz":  "{:+,.2f}",
+                        "Änderung_%": "{:+.2f}%",
+                    })
+                    .background_gradient(subset=["Änderung_%"], cmap="RdYlGn_r"),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        # ── Nicht mehr verfügbar ──────────────────────────────────────────────
+        with st.expander(f"🚫 Nicht mehr verfügbar ({len(_t_removed)})",
+                         expanded=False):
+            if _t_removed.empty:
+                st.info("Keine entfernten Produkte.")
+            else:
+                _show = ["Anbieter", "Kategorie", "Produkt", "Preistyp", "Preis",
+                         "Einheit", "Datum"]
+                st.dataframe(
+                    _t_removed[_show].sort_values(["Anbieter", "Produkt"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    # Admin: Snapshot zurücksetzen
+    if _is_admin():
+        st.divider()
+        if st.button("🔁 Snapshot zurücksetzen (aktuellen Stand als neue Baseline)",
+                     key="btn_reset_snapshot"):
+            save_snapshot(df_all)
+            for _k in ["_alerts_new", "_alerts_changed", "_alerts_removed", "_snap_ts"]:
+                st.session_state.pop(_k, None)
+            st.success("Snapshot wurde aktualisiert. Meldungen werden beim nächsten "
+                       "Datenstand neu berechnet.")
+            st.rerun()
 
 # ── Tab: Alle Preise ──────────────────────────────────────────────────────────
 
@@ -1512,3 +1730,101 @@ if _is_admin() and tab_users is not None:
                 )
                 _save_auth_config(live_cfg)
                 st.success("Passwort wurde geändert.")
+
+        # ── E-Mail Import Konfiguration ───────────────────────────────────────
+        st.divider()
+        st.markdown("#### 📧 E-Mail Import Konfiguration")
+
+        _ecfg_live = load_email_config() or {}
+        _ei   = _ecfg_live.get("imap",   {})
+        _eimp = _ecfg_live.get("import", {})
+
+        with st.form("form_email_config"):
+            st.markdown("**IMAP-Verbindung**")
+            _efc1, _efc2 = st.columns(2)
+            with _efc1:
+                _e_host   = st.text_input("IMAP Host",    value=_ei.get("host", ""))
+                _e_user   = st.text_input("Benutzername", value=_ei.get("username", ""))
+                _e_folder = st.text_input("Ordner",       value=_ei.get("folder", "INBOX"))
+            with _efc2:
+                _e_port = st.number_input("Port", min_value=1, max_value=65535,
+                                          value=int(_ei.get("port", 993)))
+                _e_pw   = st.text_input("Passwort", type="password",
+                                        value="",
+                                        help="Leer lassen = unveränderter Wert")
+                _e_ssl  = st.checkbox("SSL verwenden",
+                                      value=bool(_ei.get("use_ssl", True)))
+
+            st.markdown("**Import-Einstellungen**")
+            _efc3, _efc4 = st.columns(2)
+            with _efc3:
+                _e_interval = st.number_input(
+                    "Intervall (Minuten)", min_value=5, max_value=1440,
+                    value=int(_eimp.get("poll_interval_minutes", 30)),
+                )
+                _e_subject = st.text_input(
+                    "Betreff-Filter (optional, Teilstring)",
+                    value=_ei.get("subject_filter", ""),
+                )
+            with _efc4:
+                _e_maxsize = st.number_input(
+                    "Max. Anhang-Größe (MB)", min_value=1, max_value=100,
+                    value=int(_eimp.get("max_attachment_size_mb", 10)),
+                )
+
+            _save_email = st.form_submit_button("💾 Konfiguration speichern",
+                                                use_container_width=True)
+
+        if _save_email:
+            _new_ecfg = {
+                "imap": {
+                    "host":           _e_host,
+                    "port":           int(_e_port),
+                    "use_ssl":        _e_ssl,
+                    "username":       _e_user,
+                    "password":       _e_pw if _e_pw else _ei.get("password", ""),
+                    "folder":         _e_folder,
+                    "subject_filter": _e_subject,
+                },
+                "import": {
+                    "poll_interval_minutes":  int(_e_interval),
+                    "inbox_dir":              "lists/inbox",
+                    "allowed_extensions":     [".pdf", ".csv", ".json"],
+                    "max_attachment_size_mb": int(_e_maxsize),
+                },
+                "state": {"db_path": "data/email_state.db"},
+            }
+            from email_importer import EMAIL_CONFIG_PATH as _ECP
+            with open(_ECP, "w", encoding="utf-8") as _ef:
+                yaml.dump(_new_ecfg, _ef, allow_unicode=True, default_flow_style=False)
+            # Scheduler-Intervall aktualisieren falls Scheduler läuft
+            _sc = _get_scheduler()
+            if _sc.get_job("email_poll"):
+                _sc.reschedule_job("email_poll",
+                                   trigger="interval", minutes=int(_e_interval))
+            st.success("E-Mail Konfiguration gespeichert.")
+
+        # Test-Verbindung (außerhalb des Formulars für direktes Feedback)
+        if st.button("🔌 Verbindung testen", key="btn_test_imap"):
+            _tcfg = load_email_config()
+            if _tcfg is None:
+                st.error("Keine Konfiguration vorhanden. Bitte zuerst speichern.")
+            else:
+                import imaplib as _iml
+                with st.spinner("Verbinde mit IMAP-Server…"):
+                    try:
+                        _cls = _iml.IMAP4_SSL if _tcfg["imap"]["use_ssl"] else _iml.IMAP4
+                        _con = _cls(_tcfg["imap"]["host"], _tcfg["imap"]["port"])
+                        _con.login(_tcfg["imap"]["username"], _tcfg["imap"]["password"])
+                        _ok, _dat = _con.select(_tcfg["imap"]["folder"])
+                        _con.logout()
+                        if _ok == "OK":
+                            st.success(
+                                f"Verbindung erfolgreich – "
+                                f"{int(_dat[0])} Nachricht(en) im Ordner "
+                                f"'{_tcfg['imap']['folder']}'."
+                            )
+                        else:
+                            st.error(f"Ordner konnte nicht geöffnet werden: {_dat}")
+                    except Exception as _ex:
+                        st.error(f"Verbindungsfehler: {_ex}")
