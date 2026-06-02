@@ -4,7 +4,6 @@ Lieferanten: TWE Solar GmbH, Pesasun GmbH, pv partners AG
 Formate: PDF, erweiterbar auf CSV/JSON
 """
 
-import io
 import json
 import secrets
 from pathlib import Path
@@ -14,9 +13,6 @@ import streamlit as st
 import streamlit_authenticator as stauth
 import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
 from streamlit_authenticator.utilities import Hasher
 
 from alert_engine import compute_alerts, load_snapshot, save_snapshot
@@ -41,43 +37,6 @@ from product_search import (
 
 DATA_DIR = Path("data")
 SENTINEL = DATA_DIR / "last_import.json"
-
-
-
-# ── XLSX-Export ───────────────────────────────────────────────────────────────
-
-_HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
-_HEADER_FONT = Font(color="FFFFFF", bold=True)
-_ALT_FILL = PatternFill("solid", fgColor="D6E4F0")
-
-
-def _to_xlsx_bytes(df: pd.DataFrame) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Preisvergleich"
-
-    headers = list(df.columns)
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.fill = _HEADER_FILL
-        cell.font = _HEADER_FONT
-        cell.alignment = Alignment(horizontal="center")
-
-    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
-        ws.append(list(row))
-        if row_idx % 2 == 0:
-            for cell in ws[row_idx]:
-                cell.fill = _ALT_FILL
-
-    # Spaltenbreite automatisch
-    for col_idx, col in enumerate(df.columns, start=1):
-        lens = [len(str(col))] + [len(str(v)) for v in df[col] if v is not None]
-        max_len = max(lens) if lens else 10
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 50)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
 
 
 # ── APScheduler ──────────────────────────────────────────────────────────────
@@ -290,7 +249,6 @@ with st.sidebar:
         st.cache_data.clear()
 
     st.divider()
-    st.header("Filter")
 
 # ── Daten laden ────────────────────────────────────────────────────────────────
 
@@ -373,33 +331,8 @@ if not df_all.empty:
             _new_snap["snapshot_ts"].iloc[0] if not _new_snap.empty else None
         )
 
-# ── Sidebar-Filter ─────────────────────────────────────────────────────────────
-
-with st.sidebar:
-    if df_all.empty:
-        st.info("Noch keine Daten geladen.")
-    else:
-        anbieter_opts = sorted(df_all["Anbieter"].dropna().unique())
-        kat_opts      = sorted(df_all["Kategorie"].dropna().unique())
-        datum_opts    = sorted(df_all["Datum"].dropna().unique(), reverse=True)
-        einheit_opts  = sorted(df_all["Einheit"].dropna().unique())
-
-        sel_anbieter = st.multiselect("Anbieter",           anbieter_opts, default=anbieter_opts)
-        sel_kat      = st.multiselect("Kategorie",          kat_opts,      default=kat_opts)
-        sel_datum    = st.multiselect("Preislisten-Datum",  datum_opts,    default=datum_opts)
-        sel_einheit  = st.multiselect("Einheit",            einheit_opts,  default=einheit_opts)
-        search       = st.text_input("Produkt suchen", placeholder="z.B. Sungrow, 470W …")
-
-        mask = (
-            df_all["Anbieter"].isin(sel_anbieter)
-            & df_all["Kategorie"].isin(sel_kat)
-            & df_all["Datum"].isin(sel_datum)
-            & df_all["Einheit"].isin(sel_einheit)
-        )
-        if search:
-            mask &= df_all["Produkt"].str.contains(search, case=False, na=False)
-
-        df_filtered = df_all[mask].copy()
+# ── Keine Sidebar-Filter (Kernumfang: Best-Price) ──────────────────────────────
+df_filtered = df_all.copy()
 
 # ── Hauptbereich ───────────────────────────────────────────────────────────────
 
@@ -419,15 +352,15 @@ col4.metric("Preislisten-Daten", df_filtered["Datum"].nunique())
 
 st.divider()
 
-# Tabs – Meldungen steht an erster Position; Admins sehen zusätzlich Benutzerverwaltung
-_tab_labels = ["🔔 Meldungen", "📋 Alle Preise", "🔍 Artikelsuche", "⚖️ Preisvergleich",
-               "📈 Preishistorie", "💾 Export"]
+# Tabs – Kernumfang: Meldungen + Artikelsuche; Admins sehen zusätzlich Benutzerverwaltung
+_tab_labels = ["🔔 Meldungen", "🔍 Artikelsuche"]
 if _is_admin():
     _tab_labels.append("👤 Benutzerverwaltung")
 
 _tabs = st.tabs(_tab_labels)
-tab_alerts, tab_all, tab_search, tab_compare, tab_history, tab_export = _tabs[:6]
-tab_users = _tabs[6] if _is_admin() else None
+tab_alerts = _tabs[0]
+tab_search = _tabs[1]
+tab_users = _tabs[2] if _is_admin() else None
 
 # ── Tab: Meldungen ───────────────────────────────────────────────────────────
 
@@ -518,23 +451,6 @@ with tab_alerts:
                        "Datenstand neu berechnet.")
             st.rerun()
 
-# ── Tab: Alle Preise ──────────────────────────────────────────────────────────
-
-with tab_all:
-    st.subheader("Alle Preise")
-
-    sort_col = st.selectbox(
-        "Sortieren nach", ["Kategorie", "Anbieter", "Produkt", "Preis", "Datum"],
-        index=0, key="sort_all",
-    )
-    df_show = df_filtered.sort_values([sort_col, "Produkt"]).reset_index(drop=True)
-
-    st.dataframe(
-        df_show.style.format({"Preis": lambda x: f"{x:,.2f}" if pd.notna(x) else "auf Anfrage"}),
-        use_container_width=True,
-        height=520,
-    )
-
 # ── Tab: Artikelsuche ─────────────────────────────────────────────────────────
 
 with tab_search:
@@ -576,8 +492,7 @@ with tab_search:
         )
         if not _dims:
             st.warning(
-                "Keine Treffer für diese Kombination aus Sidebar-Filtern. "
-                "Treffer-Score senken oder Filter anpassen."
+                "Keine Treffer gefunden. Treffer-Score senken oder Suchbegriff anpassen."
             )
         else:
             _dim_labels = [f"{e} · {p}" for e, p in _dims]
@@ -635,175 +550,6 @@ with tab_search:
                         use_container_width=True,
                         hide_index=True,
                     )
-
-# ── Tab: Preisvergleich ───────────────────────────────────────────────────────
-
-with tab_compare:
-    st.subheader("Preisvergleich zwischen Anbietern")
-
-    kat_vergleich = st.selectbox(
-        "Kategorie", sorted(df_filtered["Kategorie"].dropna().unique()), key="kat_vergleich"
-    )
-    einheit_vergleich = st.selectbox(
-        "Einheit", sorted(df_filtered["Einheit"].dropna().unique()), key="ein_vergleich"
-    )
-    preistyp_vergleich = st.selectbox(
-        "Preistyp",
-        sorted(df_filtered["Preistyp"].dropna().unique()),
-        key="pt_vergleich",
-    )
-
-    df_v = df_filtered[
-        (df_filtered["Kategorie"] == kat_vergleich)
-        & (df_filtered["Einheit"] == einheit_vergleich)
-        & (df_filtered["Preistyp"] == preistyp_vergleich)
-    ].copy()
-
-    if df_v.empty:
-        st.info("Keine Daten für diese Kombination.")
-    else:
-        df_v["Datum"] = df_v["Datum"].astype(str)
-        latest   = df_v.groupby("Anbieter")["Datum"].max().reset_index(name="MaxDatum")
-        df_v     = df_v.merge(latest, on="Anbieter")
-        df_latest = df_v[df_v["Datum"] == df_v["MaxDatum"]].drop(columns=["MaxDatum"])
-
-        pivot = (
-            df_latest
-            .pivot_table(index="Produkt", columns="Anbieter", values="Preis", aggfunc="min")
-            .reset_index()
-        )
-
-        anbieter_cols = [c for c in pivot.columns if c != "Produkt"]
-        if len(anbieter_cols) >= 2:
-            a, b = anbieter_cols[0], anbieter_cols[1]
-            pivot["Differenz"] = pivot[a] - pivot[b]
-            pivot["Günstiger"] = pivot.apply(
-                lambda r: a if pd.notna(r[a]) and (pd.isna(r[b]) or r[a] <= r[b]) else b,
-                axis=1,
-            )
-
-        fmt = {col: "{:,.2f}" for col in anbieter_cols}
-        if "Differenz" in pivot.columns:
-            fmt["Differenz"] = "{:+,.2f}"
-
-        st.dataframe(pivot.style.format(fmt, na_rep="–"), use_container_width=True, height=480)
-
-        if len(anbieter_cols) >= 1:
-            min_price = df_latest.loc[
-                df_latest.groupby("Produkt")["Preis"].idxmin()
-            ][["Produkt", "Anbieter", "Preis"]].rename(
-                columns={"Anbieter": "Günstigster Anbieter", "Preis": "Günstigster Preis"}
-            )
-            st.markdown("**Günstigster Anbieter je Produkt**")
-            st.dataframe(
-                min_price.style.format({"Günstigster Preis": "{:,.2f}"}),
-                use_container_width=True, height=300,
-            )
-
-# ── Tab: Preishistorie ────────────────────────────────────────────────────────
-
-with tab_history:
-    st.subheader("Preisentwicklung über Zeit")
-
-    if df_filtered["Datum"].nunique() < 2:
-        st.info("Für eine Preisentwicklungsanalyse werden mindestens zwei Preislisten-Daten benötigt.")
-    else:
-        col_h1, col_h2, col_h3 = st.columns(3)
-        with col_h1:
-            kat_hist = st.selectbox(
-                "Kategorie", sorted(df_filtered["Kategorie"].dropna().unique()), key="kat_hist"
-            )
-        with col_h2:
-            ein_hist = st.selectbox(
-                "Einheit", sorted(df_filtered["Einheit"].dropna().unique()), key="ein_hist"
-            )
-        with col_h3:
-            pt_hist = st.selectbox(
-                "Preistyp", sorted(df_filtered["Preistyp"].dropna().unique()), key="pt_hist"
-            )
-
-        df_h = df_filtered[
-            (df_filtered["Kategorie"] == kat_hist)
-            & (df_filtered["Einheit"] == ein_hist)
-            & (df_filtered["Preistyp"] == pt_hist)
-        ].copy()
-
-        if df_h.empty:
-            st.info("Keine Daten.")
-        else:
-            prod_counts = df_h.groupby("Produkt")["Datum"].nunique()
-            multi_prods = prod_counts[prod_counts >= 2].index.tolist()
-
-            if not multi_prods:
-                st.info("Keine Produkte mit mehreren Preisdaten gefunden.")
-            else:
-                sel_prod  = st.multiselect(
-                    "Produkte auswählen", multi_prods, default=multi_prods[:5], key="hist_prod"
-                )
-                df_h_sel  = df_h[df_h["Produkt"].isin(sel_prod)]
-                pivot_hist = df_h_sel.pivot_table(
-                    index="Datum", columns="Produkt", values="Preis", aggfunc="min"
-                ).sort_index()
-                st.line_chart(pivot_hist, height=400)
-
-                st.markdown("**Preisveränderung (ältestes → neuestes Datum)**")
-                change_rows = []
-                for prod in sel_prod:
-                    sub = df_h_sel[df_h_sel["Produkt"] == prod].sort_values("Datum")
-                    if len(sub) >= 2:
-                        old_p, new_p = sub.iloc[0]["Preis"], sub.iloc[-1]["Preis"]
-                        old_d, new_d = sub.iloc[0]["Datum"],  sub.iloc[-1]["Datum"]
-                        if pd.notna(old_p) and pd.notna(new_p) and old_p != 0:
-                            change_rows.append({
-                                "Produkt": prod,
-                                f"Preis {old_d}": old_p,
-                                f"Preis {new_d}": new_p,
-                                "Veränderung %": (new_p - old_p) / old_p * 100,
-                            })
-                if change_rows:
-                    df_change  = pd.DataFrame(change_rows)
-                    num_cols   = [c for c in df_change.columns if c != "Produkt"]
-                    st.dataframe(
-                        df_change.style
-                        .format({c: "{:,.2f}"  for c in num_cols if "%" not in c})
-                        .format({c: "{:+.1f}%" for c in num_cols if "%" in c})
-                        .background_gradient(subset=["Veränderung %"], cmap="RdYlGn_r"),
-                        use_container_width=True,
-                    )
-
-# ── Tab: Export ────────────────────────────────────────────────────────────────
-
-with tab_export:
-    st.subheader("Daten exportieren")
-
-    st.markdown(
-        f"Aktuell gefilterte Datensätze: **{len(df_filtered):,}** "
-        f"(von {len(df_all):,} gesamt)"
-    )
-
-    col_e1, col_e2 = st.columns(2)
-
-    with col_e1:
-        st.download_button(
-            label="⬇️ Als XLSX exportieren (gefiltert)",
-            data=_to_xlsx_bytes(df_filtered),
-            file_name="preisvergleich_gefiltert.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-    with col_e2:
-        st.download_button(
-            label="⬇️ Als XLSX exportieren (alle Daten)",
-            data=_to_xlsx_bytes(df_all),
-            file_name="preisvergleich_alle.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-    st.markdown("---")
-    st.markdown("**Vorschau der exportierten Daten:**")
-    st.dataframe(df_filtered.head(20), use_container_width=True)
 
 # ── Tab: Benutzerverwaltung (nur Admins) ──────────────────────────────────────
 

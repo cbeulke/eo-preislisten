@@ -1,6 +1,12 @@
 # PV-Preislisten-Vergleich
 
-Streamlit-App zum Vergleich von Photovoltaik-Preislisten (PDF, CSV, JSON) mehrerer Lieferanten.
+Streamlit-App zur Erkennung und Auswahl von **Best-Price-Angeboten** über mehrere Anbieter aus Preislisten (PDF, CSV, JSON).
+
+Kernworkflow:
+- Daten aus `lists/` automatisch laden oder Dateien hochladen
+- Optional: E-Mail Import (IMAP) speichert Anhänge in `lists/inbox/`
+- Tab **Meldungen** zeigt Änderungen gegenüber dem letzten Snapshot
+- Tab **Artikelsuche**: Fuzzy-Suche + Clustering + direkte Anbieter-Preisübersicht inkl. günstigstem Anbieter
 
 ## Starten
 
