@@ -1,0 +1,19 @@
+credentials:
+  usernames:
+    admin:
+      name: Administrator
+      email: admin
+      password: "$2b$12$w37oEBiZUeKEZCYTKNNyje0Y6uJngSHW9QM2IKfA9JapVu5wpzK.y"
+      roles:
+        - admin
+    viewer:
+      name: Betrachter
+      email: viewer
+      password: "$2b$12$w2cSgZO6OD.gVkOqQUfW7uYwTNdjZGLuBiLxhPp6esixlb1d3udf."
+      roles:
+        - viewer
+
+cookie:
+  name: pv_preisvergleich
+  key: "25ccbb1a4d8261f378c5daf75edd1f0701123c86d9980e4629946f522847e2db"
+  expiry_days: 30
